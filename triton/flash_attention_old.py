@@ -4,48 +4,6 @@ import triton
 import triton.language as tl
 
 
-_BWD_TUNING_CONFIGS = [
-    triton.Config(
-        {"BLOCK_Q": BLOCK_Q, "BLOCK_KV": BLOCK_KV},
-        num_stages=num_stages,
-        num_warps=num_warps,
-    )
-    for BLOCK_Q in [64, 128]
-    for BLOCK_KV in [32, 64]
-    for num_stages in [3, 4, 7]
-    for num_warps in [2, 4]
-]
-
-_PREPROCESS_TUNING_CONFIGS = [
-    triton.Config(
-        {"BLOCK_SIZE_Q": BLOCK_SIZE_Q},
-        num_stages=num_stages,
-        num_warps=num_warps,
-    )
-    for BLOCK_SIZE_Q in [64, 128]
-    for num_stages in [3, 4, 7]
-    for num_warps in [2, 4]
-]
-
-
-def _prune_bwd_configs(configs, nargs, **kwargs):
-    merged = {**nargs, **kwargs}
-    seq = int(merged["SEQ_LEN"])
-    pruned = [
-        c
-        for c in configs
-        if seq % c.kwargs["BLOCK_Q"] == 0 and seq % c.kwargs["BLOCK_KV"] == 0
-    ]
-    return pruned if pruned else configs
-
-
-def _prune_preprocess_configs(configs, nargs, **kwargs):
-    merged = {**nargs, **kwargs}
-    seq = int(merged["SEQ_LEN"])
-    pruned = [c for c in configs if seq % c.kwargs["BLOCK_SIZE_Q"] == 0]
-    return pruned if pruned else configs
-
-
 @triton.jit
 def _attn_fwd_inner(
     O_block,
@@ -288,11 +246,6 @@ def _attn_fwd(
     tl.store(O_block_ptr, O_block.to(O.type.element_ty))
 
 
-@triton.autotune(
-    configs=_PREPROCESS_TUNING_CONFIGS,
-    key=["SEQ_LEN", "HEAD_DIM"],
-    prune_configs_by={"early_config_prune": _prune_preprocess_configs},
-)
 @triton.jit
 def _attn_bwd_preprocess(
     O,
@@ -327,11 +280,6 @@ def _attn_bwd_preprocess(
     tl.store(D_block_ptrs, D_block)
 
 
-@triton.autotune(
-    configs=_BWD_TUNING_CONFIGS,
-    key=["SEQ_LEN", "HEAD_DIM", "STAGE"],
-    prune_configs_by={"early_config_prune": _prune_bwd_configs},
-)
 @triton.jit
 def _attn_bwd_dq(
     Q,
@@ -403,21 +351,16 @@ def _attn_bwd_dq(
 
     Di = tl.load(D + offs_q)
 
-    if STAGE == 3:
-        # Causal: query q only attends to keys k <= q, so for this Q-block
-        # (max q = start_q + BLOCK_Q - 1) keys k >= start_q + BLOCK_Q never contribute.
-        hi_kv = tl.minimum(SEQ_LEN, start_q + BLOCK_Q)
-    else:
-        hi_kv = SEQ_LEN
-
-    for curr_kv in range(0, hi_kv, BLOCK_KV):
+    curr_kv = 0
+    num_steps = SEQ_LEN // BLOCK_KV
+    for blk_idx in range(num_steps):
         K_T_block = tl.load(kT_ptrs)
         V_T_block = tl.load(vT_ptrs)
         QK_block = softmax_scale * tl.dot(Q_block, K_T_block)
         P_block = tl.math.exp(QK_block - M_block)
 
         if STAGE == 3:
-            # Autoregressive masking (still needed when hi_kv is not a multiple of BLOCK_KV).
+            # Autoregressive masking.
             offs_kv = curr_kv + tl.arange(0, BLOCK_KV)
             mask_block = offs_q[:, None] >= offs_kv[None, :]
             P_block = tl.where(mask_block, P_block, 0.0)
@@ -430,6 +373,7 @@ def _attn_bwd_dq(
         # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
         dQ_block += softmax_scale * tl.dot(dS_block, tl.trans(K_T_block))
         # Increment pointers.
+        curr_kv += BLOCK_KV
         kT_ptrs += BLOCK_KV * stride_seq
         vT_ptrs += BLOCK_KV * stride_seq
 
@@ -437,11 +381,6 @@ def _attn_bwd_dq(
     tl.store(dQ_block_ptrs, dQ_block)
 
 
-@triton.autotune(
-    configs=_BWD_TUNING_CONFIGS,
-    key=["SEQ_LEN", "HEAD_DIM", "STAGE"],
-    prune_configs_by={"early_config_prune": _prune_bwd_configs},
-)
 @triton.jit
 def _attn_bwd_dk_dv(
     Q,
@@ -507,21 +446,19 @@ def _attn_bwd_dk_dv(
         V + offs_kv[:, None] * stride_seq + offs_dim[None, :] * stride_dim
     )  # Shape: (BLOCK_KV1, HEAD_DIM)
 
-    # Causal: for keys in this KV-block, only queries q >= min_key can have nonzero P;
-    # skip Q-blocks whose entire range lies below start_kv.
-    if STAGE == 3:
-        lo_need = tl.maximum(0, start_kv - BLOCK_Q + 1)
-        lo_q = (lo_need + BLOCK_Q - 1) // BLOCK_Q * BLOCK_Q
-        num_steps = (SEQ_LEN - lo_q + BLOCK_Q - 1) // BLOCK_Q
-    else:
-        lo_q = 0
-        num_steps = SEQ_LEN // BLOCK_Q
+    offs_q = tl.arange(0, BLOCK_Q)
 
-    base_offs = tl.arange(0, BLOCK_Q)
-    curr_q = lo_q
-    qT_ptrs = Q + (curr_q + base_offs)[None, :] * stride_seq + offs_dim[:, None] * stride_dim
-    dO_ptrs = dO + (curr_q + base_offs)[:, None] * stride_seq + offs_dim[None, :] * stride_dim
+    # We access the Q as a transposed array, so that's why we treat offs_q as a column vector ans offs_dim as a row vector
+    # This is equivalent to doing:
+    # q_ptrs = Q + offs_q[:, None] * stride_seq + offs_dim[None, :] * stride_dim
+    # qT_ptrs = tl.trans(q_ptrs)
+    # We point to the first BLOCK_Q rows of Q for both the qT and dO pointers, inside the for loop we will move forward by BLOCK_Q rows at each iteration.
+    qT_ptrs = Q + offs_q[None, :] * stride_seq + offs_dim[:, None] * stride_dim
+    dO_ptrs = dO + offs_q[:, None] * stride_seq + offs_dim[None, :] * stride_dim
 
+    # Iterates over the sequence dimension of the query
+    curr_q = 0
+    num_steps = SEQ_LEN // BLOCK_Q
     for blk_idx in range(num_steps):
         # Load a block of Q
         qT_block = tl.load(qT_ptrs)
@@ -649,11 +586,10 @@ class TritonAttention(torch.autograd.Function):
         dV = torch.empty_like(V)
 
         BATCH_SIZE, NUM_HEADS, SEQ_LEN = Q.shape[:3]
+        NUM_WARPS, NUM_STAGES = 4, 3
+        BLOCK_SIZE_MICRO, BLOCK_SIZE_MACRO = 32, 128
 
-        preprocess_grid = lambda meta: (
-            SEQ_LEN // meta["BLOCK_SIZE_Q"],
-            BATCH_SIZE * NUM_HEADS,
-        )
+        preprocess_grid = (SEQ_LEN // BLOCK_SIZE_MACRO, BATCH_SIZE * NUM_HEADS)
         D = torch.empty_like(M)  # Shape: (BATCH_SIZE, NUM_HEADS, SEQ_LEN)
 
         # Compute all the elements Di
@@ -662,24 +598,16 @@ class TritonAttention(torch.autograd.Function):
             dO=dO,
             D=D,
             SEQ_LEN=SEQ_LEN,
+            BLOCK_SIZE_Q=BLOCK_SIZE_MACRO,
             HEAD_DIM=ctx.HEAD_DIM,
         )
+
+        grid = (SEQ_LEN // BLOCK_SIZE_MACRO, 1, BATCH_SIZE * NUM_HEADS)
 
         stage = 3 if ctx.causal else 1
 
-        grid_dk_dv = lambda meta: (
-            SEQ_LEN // meta["BLOCK_KV"],
-            1,
-            BATCH_SIZE * NUM_HEADS,
-        )
-        grid_dq = lambda meta: (
-            SEQ_LEN // meta["BLOCK_Q"],
-            1,
-            BATCH_SIZE * NUM_HEADS,
-        )
-
-        # Fix KV and iterate over Q blocks (inner loop; causal skips early Q-blocks).
-        _attn_bwd_dk_dv[grid_dk_dv](
+        # Fix KV and iterate through all the Q blocks
+        _attn_bwd_dk_dv[grid](
             Q=Q,
             K=K,
             V=V,
@@ -696,12 +624,16 @@ class TritonAttention(torch.autograd.Function):
             stride_dim=Q.stride(3),
             NUM_HEADS=NUM_HEADS,
             SEQ_LEN=SEQ_LEN,
+            BLOCK_Q=BLOCK_SIZE_MICRO,
+            BLOCK_KV=BLOCK_SIZE_MACRO,
             HEAD_DIM=ctx.HEAD_DIM,
             STAGE=stage,
+            num_warps=NUM_WARPS,
+            num_stages=NUM_STAGES,
         )
 
-        # Fix Q and iterate over KV blocks (inner loop; causal skips trailing key-blocks).
-        _attn_bwd_dq[grid_dq](
+        # Fix Q and iterate through all the KV block
+        _attn_bwd_dq[grid](
             Q=Q,
             K=K,
             V=V,
@@ -718,8 +650,12 @@ class TritonAttention(torch.autograd.Function):
             stride_dim=Q.stride(3),
             NUM_HEADS=NUM_HEADS,
             SEQ_LEN=SEQ_LEN,
+            BLOCK_Q=BLOCK_SIZE_MACRO,
+            BLOCK_KV=BLOCK_SIZE_MICRO,
             HEAD_DIM=ctx.HEAD_DIM,
             STAGE=stage,
+            num_warps=NUM_WARPS,
+            num_stages=NUM_STAGES,
         )
 
         return dQ, dK, dV, None, None
@@ -780,6 +716,6 @@ def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float1
 
 
 if __name__ == "__main__":
-    test_op(BATCH_SIZE=2, NUM_HEADS=16, SEQ_LEN=4096, HEAD_DIM=64, causal=True)
-    test_op(BATCH_SIZE=2, NUM_HEADS=16, SEQ_LEN=4096, HEAD_DIM=64, causal=False)
+    test_op(BATCH_SIZE=8, NUM_HEADS=16, SEQ_LEN=4096, HEAD_DIM=64, causal=True)
+    test_op(BATCH_SIZE=8, NUM_HEADS=16, SEQ_LEN=4096, HEAD_DIM=64, causal=False)
     print("PASSED")
