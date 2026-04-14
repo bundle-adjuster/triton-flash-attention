@@ -41,6 +41,23 @@ class BenchCfg:
     chrome_trace_dir: str | None
 
 
+DTYPE_MAP: dict[str, torch.dtype] = {
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "float32": torch.float32,
+}
+
+
+def dtype_to_name(dtype: torch.dtype) -> str:
+    if dtype == torch.float16:
+        return "float16"
+    if dtype == torch.bfloat16:
+        return "bfloat16"
+    if dtype == torch.float32:
+        return "float32"
+    return str(dtype)
+
+
 def bench_cuda_ms(
     fn: Callable[[], None], warmup: int, repeat: int, amortize_warmup: bool
 ) -> float:
@@ -252,37 +269,37 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--head-dim", type=int, default=64)
     p.add_argument("--causal", action="store_true", default=True)
     p.add_argument("--no-causal", action="store_false", dest="causal")
-    p.add_argument("--dtype", choices=["float16", "bfloat16"], default="float16")
+    p.add_argument(
+        "--dtype",
+        choices=["float16", "bfloat16", "float32"],
+        default="float16",
+        help="Single dtype (kept for backwards compatibility).",
+    )
+    p.add_argument(
+        "--dtypes",
+        default="",
+        help="Comma-separated dtypes (e.g. float16,bfloat16,float32). Overrides --dtype when set.",
+    )
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--repeat", type=int, default=50)
     p.add_argument("--amortize-warmup", action="store_true")
     p.add_argument("--profile", action="store_true")
     p.add_argument("--profile-iters", type=int, default=5)
     p.add_argument("--chrome-trace-dir", default=None)
+    p.add_argument(
+        "--sweep-seq-lens",
+        default="",
+        help="Comma-separated seq lens (e.g. 512,1024,2048,4096) for paper-style sweep.",
+    )
     return p.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
-    if not torch.cuda.is_available():
-        print("CUDA is required.", file=sys.stderr)
-        return 1
-
-    cfg = BenchCfg(
-        batch=args.batch,
-        heads=args.heads,
-        seq_len=args.seq_len,
-        head_dim=args.head_dim,
-        causal=args.causal,
-        dtype=torch.float16 if args.dtype == "float16" else torch.bfloat16,
-        warmup=args.warmup,
-        repeat=args.repeat,
-        amortize_warmup=args.amortize_warmup,
-        profile=args.profile,
-        profile_iters=args.profile_iters,
-        chrome_trace_dir=args.chrome_trace_dir,
-    )
-
+def run_one_config(cfg: BenchCfg) -> list[tuple[str, float]]:
+    if cfg.dtype == torch.float32:
+        print(
+            "Note: flash kernels (SDPA flash / flash-attn) require fp16 or bf16; "
+            "float32 will likely skip those backends."
+        )
     q, k, v, scale = make_inputs(cfg)
 
     runners: list[tuple[str, Callable[[], None]]] = []
@@ -301,9 +318,10 @@ def main() -> int:
     else:
         print("Skipping FA1 legacy: symbol/API not available in this flash-attn build.")
 
+    dtype_name = dtype_to_name(cfg.dtype)
     print(
         f"shape (B,H,S,D)=({cfg.batch},{cfg.heads},{cfg.seq_len},{cfg.head_dim}) "
-        f"dtype={args.dtype} causal={cfg.causal}"
+        f"dtype={dtype_name} causal={cfg.causal}"
     )
     timing_mode = (
         f"amortized over warmup+repeat={cfg.warmup + cfg.repeat}"
@@ -315,7 +333,11 @@ def main() -> int:
     with torch.no_grad():
         results: list[tuple[str, float]] = []
         for name, fn in runners:
-            ms = bench_cuda_ms(fn, cfg.warmup, cfg.repeat, cfg.amortize_warmup)
+            try:
+                ms = bench_cuda_ms(fn, cfg.warmup, cfg.repeat, cfg.amortize_warmup)
+            except Exception as e:
+                print(f"{name}: skipped ({type(e).__name__}: {e})")
+                continue
             print(f"{name}: {ms:.4f} ms/call")
             results.append((name, ms))
 
@@ -323,14 +345,96 @@ def main() -> int:
                 trace = None
                 if cfg.chrome_trace_dir:
                     safe = name.replace(" ", "_").replace("/", "_")
-                    trace = os.path.join(cfg.chrome_trace_dir, f"trace_{safe}.json")
+                    trace = os.path.join(
+                        cfg.chrome_trace_dir, f"trace_{dtype_name}_s{cfg.seq_len}_{safe}.json"
+                    )
                 run_profiler(name, fn, cfg.profile_iters, trace)
 
     # relative speedups vs fastest implementation
+    if not results:
+        print("No runnable backends for this configuration.")
+        return results
     fastest_name, fastest_ms = min(results, key=lambda x: x[1])
     print(f"fastest: {fastest_name} ({fastest_ms:.4f} ms/call)")
     for name, ms in results:
         print(f"relative {name}: {ms / fastest_ms:.3f}x")
+
+    return results
+
+
+def main() -> int:
+    args = parse_args()
+    if not torch.cuda.is_available():
+        print("CUDA is required.", file=sys.stderr)
+        return 1
+
+    if args.dtypes.strip():
+        dtype_names = [x.strip() for x in args.dtypes.split(",") if x.strip()]
+    else:
+        dtype_names = [args.dtype]
+    bad = [d for d in dtype_names if d not in DTYPE_MAP]
+    if bad:
+        print(f"Unsupported dtype(s): {bad}. Allowed: {sorted(DTYPE_MAP)}", file=sys.stderr)
+        return 2
+
+    base_cfg = BenchCfg(
+        batch=args.batch,
+        heads=args.heads,
+        seq_len=args.seq_len,
+        head_dim=args.head_dim,
+        causal=args.causal,
+        dtype=DTYPE_MAP[dtype_names[0]],
+        warmup=args.warmup,
+        repeat=args.repeat,
+        amortize_warmup=args.amortize_warmup,
+        profile=args.profile,
+        profile_iters=args.profile_iters,
+        chrome_trace_dir=args.chrome_trace_dir,
+    )
+
+    if not args.sweep_seq_lens and len(dtype_names) == 1:
+        run_one_config(base_cfg)
+        return 0
+
+    seq_lens: list[int] = []
+    raw_seq = args.sweep_seq_lens if args.sweep_seq_lens else str(base_cfg.seq_len)
+    for tok in raw_seq.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        seq_lens.append(int(tok))
+    if not seq_lens:
+        print("No valid sweep sequence lengths parsed.", file=sys.stderr)
+        return 2
+
+    print("=== Sweep mode ===")
+    print(f"dtypes={dtype_names}")
+    print(f"seq_lens={seq_lens}")
+    print("Tip: paper-like behavior is usually clearer at longer contexts.\n")
+
+    rows: list[tuple[str, int, dict[str, float]]] = []
+    for dtype_name in dtype_names:
+        for s in seq_lens:
+            cfg = BenchCfg(
+                **{
+                    **base_cfg.__dict__,
+                    "seq_len": s,
+                    "dtype": DTYPE_MAP[dtype_name],
+                }
+            )
+            print(f"\n--- dtype={dtype_name} seq_len={s} ---")
+            results = run_one_config(cfg)
+            rows.append((dtype_name, s, {k: v for k, v in results}))
+
+    print("\n=== Sweep summary (ms/call) ===")
+    for dtype_name, s, metrics in rows:
+        parts = [f"dtype={dtype_name}", f"S={s}"]
+        for name in ("repo triton", "torch sdpa flash", "flash-attn FA2", "flash-attn legacy (flash_attn_varlen_func)"):
+            if name in metrics:
+                parts.append(f"{name}={metrics[name]:.4f}")
+        if "flash-attn FA2" in metrics and "repo triton" in metrics:
+            parts.append(f"repo/FA2={metrics['repo triton'] / metrics['flash-attn FA2']:.3f}x")
+        print(" | ".join(parts))
 
     return 0
 

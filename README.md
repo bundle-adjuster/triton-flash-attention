@@ -54,6 +54,8 @@ Optional:
 - `--amortize-warmup` include warmup in reported ms/call
 - `--profile --profile-iters N` print `torch.profiler` summaries
 - `--chrome-trace-dir DIR` export per-backend trace JSON files
+- `--sweep-seq-lens 512,1024,2048,4096` run a paper-style sequence-length sweep and print a summary table
+- `--dtypes float16,bfloat16,float32` run multiple dtypes in one invocation (for unsupported backend+dtype pairs, the script prints a skip message)
 
 Notes:
 
