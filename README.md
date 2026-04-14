@@ -32,6 +32,106 @@ python benchmark_attention.py --amortize-warmup --warmup 30 --repeat 50
 python benchmark_attention.py --profile --sdpa-backend flash
 ```
 
+## Full FA1 / FA2 benchmarking
+
+For full-kernel comparisons, use `triton/benchmark_fa1_fa2.py`. It benchmarks:
+
+- this repo's Triton attention (`TritonAttention`)
+- PyTorch SDPA flash backend
+- FlashAttention v2 from `flash-attn` (`flash_attn_func`) when installed
+- legacy FA1 API if exposed by your installed `flash-attn` build
+
+Install and run:
+
+```bash
+pip install flash-attn
+cd triton
+python benchmark_fa1_fa2.py --batch 2 --heads 16 --seq-len 1024 --head-dim 64 --causal --warmup 20 --repeat 50
+```
+
+Optional:
+
+- `--amortize-warmup` include warmup in reported ms/call
+- `--profile --profile-iters N` print `torch.profiler` summaries
+- `--chrome-trace-dir DIR` export per-backend trace JSON files
+
+Notes:
+
+- FA1 support depends on the exact `flash-attn` version/build (legacy symbol/API availability).
+- If FA1/FA2 symbols are missing, the script prints a skip message and continues.
+
+## CUDA FlashAttention benchmark
+
+The `cuda/` folder now includes `flash_attention_cuda.cu`, a CUDA forward-attention benchmark with:
+
+- `CUDA flash attention` kernel (streaming / online softmax, FlashAttention-style, no full score matrix materialization)
+- `CUDA regular attention` kernel (multi-pass softmax baseline on CUDA)
+- optional output comparison between flash and regular CUDA kernels
+- warmup/repeat timing with optional warmup amortization
+- optional profiler start/stop hooks
+
+Build and run:
+
+```bash
+cd cuda
+make flash_attention_cuda.out
+./flash_attention_cuda.out --batch 2 --heads 16 --seq-len 1024 --head-dim 64 --causal --warmup 20 --repeat 50
+```
+
+Useful flags:
+
+- `--amortize-warmup` include warmup in reported ms/call (otherwise warmup is excluded from timing)
+- `--check` / `--no-check` enable/disable `max |flash - regular|` output validation
+- `--profile` wraps benchmark loops with `cudaProfilerStart/Stop`
+
+For external profiling:
+
+```bash
+nsys profile -o fa_cuda_report ./flash_attention_cuda.out --batch 2 --heads 16 --seq-len 1024 --head-dim 64 --repeat 50 --no-check --profile
+ncu --set full ./flash_attention_cuda.out --batch 2 --heads 16 --seq-len 1024 --head-dim 64 --repeat 20 --no-check
+```
+
+## CUTLASS attention benchmark
+
+The `cuda/` folder also includes `cutlass_attention.cu`, a unified benchmark that runs all three kernels on the same `(Q, K, V)` inputs:
+
+- CUTLASS attention
+- CUDA flash attention (online softmax)
+- optional CUDA regular attention (disabled by default because it is very slow)
+
+CUTLASS path uses:
+
+- `QK^T` (attention scores)
+- softmax (custom CUDA kernel, optional causal mask)
+- `P @ V` (output projection)
+
+It supports the same benchmark/profiling options as the CUDA benchmark:
+
+- `--warmup` / `--repeat`
+- `--amortize-warmup`
+- `--check` / `--no-check` (prints `max |cutlass - flash|`)
+- `--include-regular` also run regular CUDA attention and print regular-vs-flash speedup/error
+- `--profile`
+
+Build requirements:
+
+- CUTLASS checkout available locally
+- `CUTLASS_PATH` pointing to that checkout (or `/usr/local/cutlass`)
+
+```bash
+git clone https://github.com/NVIDIA/cutlass.git
+cd cuda
+make cutlass_attention.out CUTLASS_PATH=/path/to/cutlass
+./cutlass_attention.out --batch 2 --heads 16 --seq-len 1024 --head-dim 64 --causal --warmup 20 --repeat 50
+```
+
+Profile examples:
+
+```bash
+nsys profile -o cutlass_attention_report ./cutlass_attention.out --batch 2 --heads 16 --seq-len 1024 --head-dim 64 --repeat 50 --no-check --profile
+ncu --set full ./cutlass_attention.out --batch 2 --heads 16 --seq-len 1024 --head-dim 64 --repeat 20 --no-check
+```
+
 Not tested on AMD, so let me know!
 
 ## Exercise 1: autotuning the backwards pass
